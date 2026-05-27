@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::{clone_move, log_fmt, utils::*};
 use wasm_bindgen::prelude::*;
 use web_sys::{js_sys::*, *};
@@ -5,27 +7,30 @@ use web_sys::{js_sys::*, *};
 #[derive(Clone)]
 pub struct MessageGatherer {
     should_exit: SmartCell<bool>,
-    messages: SmartPtr<Vec<(String, String)>>,
+    messages: SmartPtr<VecDeque<(String, String)>>,
 }
 impl MessageGatherer {
     pub fn new() -> Self {
         Self {
             should_exit: SmartCell::new(false),
-            messages: SmartPtr::new(Vec::new()),
+            messages: SmartPtr::new(VecDeque::new()),
         }
     }
-    pub fn drain(&self) -> Vec<(String, String)> {
-        self.messages.borrow_mut().drain(..).collect()
+    pub fn pop_message(&self) -> Option<(String, String)>{
+        self.messages.borrow_mut().pop_front()
+    }
+    pub fn clear_messages(&self) {
+        self.messages.borrow_mut().clear();
     }
     pub fn stop(&self) {
         self.should_exit.set(true);
     }
 }
 impl SocketListener for MessageGatherer {
-    fn listen(&self, handler: &WebSocketHandler, command: &str, data: &str) -> bool {
+    fn listen(&self, _: &WebSocketHandler, command: &str, data: &str) -> bool {
         self.messages
             .borrow_mut()
-            .push((command.into(), data.into()));
+            .push_back((command.into(), data.into()));
         !self.should_exit.get()
     }
 }

@@ -76,6 +76,12 @@ impl<T> NullSmartPtr<T> {
         };
         Some(reference)
     }
+    pub fn try_unwrap(self) -> Result<T, ()>{
+        match self.0.borrow_mut().take(){
+            Some(value) => Ok(value),
+            None => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +124,7 @@ impl<T> Clone for SmartPtr<T>{
 pub async fn wait_until<T>(tick_delay: u32, timeout: u32, mut condition: impl FnMut()->Result<Option<T>, ()>) -> Result<T, ()>{
     let mut time = 0;
     loop {
-        web_sleep(tick_delay as i32);
+        web_sleep(tick_delay as i32).await;
         let result = condition();
         if result.is_err(){
             return Err(())
