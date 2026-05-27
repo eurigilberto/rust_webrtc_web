@@ -84,6 +84,12 @@ impl<T> NullSmartPtr<T> {
     }
 }
 
+impl<T: Clone> NullSmartPtr<T> {
+    pub fn try_clone_inner(&self)->Option<T>{
+        self.borrow().map(|t| t.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SmartCell<T: Copy>(Rc<Cell<T>>);
 impl<T: Copy> SmartCell<T> {

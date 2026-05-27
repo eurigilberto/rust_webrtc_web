@@ -4,6 +4,14 @@ use crate::{clone_move, log_fmt, utils::*};
 use wasm_bindgen::prelude::*;
 use web_sys::{js_sys::*, *};
 
+pub mod socket_cmd{
+    pub const ID: &'static str = "#ID";
+    pub const CHECK_ID: &'static str = "#CHECK_ID";
+    pub const CHECK_ID_RES: &'static str = "#CHECK_ID_RES";
+    pub const OFFER: &'static str = "#OFFER";
+    pub const ANSWER: &'static str = "#ANSWER";
+}
+
 #[derive(Clone)]
 pub struct MessageGatherer {
     should_exit: SmartCell<bool>,
@@ -44,6 +52,12 @@ pub struct WebSocketHandler {
     pub socket: WebSocket,
     listeners: SmartPtr<Vec<Box<dyn SocketListener>>>,
     queued_listeners: SmartPtr<Vec<Box<dyn SocketListener>>>,
+}
+
+impl std::fmt::Debug for WebSocketHandler{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketHandler").field("id", &self.id).field("socket", &self.socket).finish()
+    }
 }
 
 impl Clone for WebSocketHandler {
@@ -87,10 +101,10 @@ impl WebSocketHandler {
 }
 
 pub struct WebSocketCreationConfig<'a> {
-    url: &'a str,
-    retry_count: u32,
-    delay_per_retry: u32,
-    timeout: u32,
+    pub url: &'a str,
+    pub retry_count: u32,
+    pub delay_per_retry: u32,
+    pub per_try_timeout: u32,
 }
 
 pub async fn start_websocket<'url>(
@@ -101,7 +115,7 @@ pub async fn start_websocket<'url>(
             let handler = WebSocketHandler::new(id, socket.clone());
             let on_message_received = clone_move!(handler => move |e: MessageEvent| {
                 let msg = e.data().as_string().unwrap();
-                log_fmt!("Received msg {}", msg);
+                //log_fmt!("Received msg {}", msg);
                 let command_range = msg.find(' ').unwrap_or(msg.len());
                 let command = &msg[..command_range];
                 let msg = msg[command_range..].trim();
@@ -134,7 +148,7 @@ async fn try_start_websocket(config: WebSocketCreationConfig<'_>) -> Result<(u64
                 let msg = e.data().as_string().unwrap();
                 let command_range = msg.find(' ').unwrap_or(msg.len());
                 let command = &msg[..command_range];
-                if command == "#ID" {
+                if command == socket_cmd::ID {
                     let msg = msg[command_range..].trim();
                     let id_range = msg.find(' ').unwrap_or(msg.len());
                     let maybe_id = u64::from_str_radix(&msg[..id_range], 10);
@@ -164,7 +178,7 @@ async fn try_start_websocket(config: WebSocketCreationConfig<'_>) -> Result<(u64
             log_fmt!("Creation try count {}", creation_try_count);
             return Ok(Some((*id, websocket.clone())));
         };
-        if let Ok((id, socket)) = wait_until(100, config.timeout, wait_creation).await {
+        if let Ok((id, socket)) = wait_until(100, config.per_try_timeout, wait_creation).await {
             return Ok((id, socket));
         }
 

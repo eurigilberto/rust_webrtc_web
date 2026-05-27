@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
+use crate::{clone_move, log_fmt, utils::*, websocket::*};
 use wasm_bindgen::prelude::*;
 use web_sys::{js_sys::*, *};
-use crate::{websocket::*, clone_move, utils::*};
 
 mod inner;
 use inner::*;
@@ -13,61 +13,98 @@ pub struct DataChannel {
     is_open: SmartCell<bool>,
     copy_target: SmartPtr<Vec<u8>>,
     queue: SmartPtr<VecDeque<u8>>,
-    msg_size: SmartPtr<VecDeque<usize>>
+    msg_size: SmartPtr<VecDeque<usize>>,
 }
 
-impl DataChannel{
-    pub fn new(channel: RtcDataChannel)->Self{
+impl DataChannel {
+    pub fn new(channel: RtcDataChannel) -> Self {
         let is_open = SmartCell::new(true);
-        let data_channel = Self{
+        let data_channel = Self {
             channel: channel.clone(),
             is_open: is_open.clone(),
             copy_target: SmartPtr::new(Vec::new()),
             queue: SmartPtr::new(VecDeque::new()),
-            msg_size: SmartPtr::new(VecDeque::new())
+            msg_size: SmartPtr::new(VecDeque::new()),
         };
         channel.set_onopen(None);
-        let on_message: Closure<dyn FnMut(_)> = Closure::new(clone_move!(data_channel => move |e: MessageEvent|{
-            let buffer: ArrayBuffer = e.data().into();
-            let buffer = Uint8Array::new(&buffer);
-            data_channel.push_message(buffer);
-        }));
+        let on_message: Closure<dyn FnMut(_)> =
+            Closure::new(clone_move!(data_channel => move |e: MessageEvent|{
+                let buffer: ArrayBuffer = e.data().into();
+                let buffer = Uint8Array::new(&buffer);
+                data_channel.push_message(buffer);
+            }));
         channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        on_message.forget();
+
         let on_close: Closure<dyn FnMut(_)> = Closure::new(clone_move!(is_open => move |_: Event|{
             is_open.set(false);
         }));
         channel.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+        on_close.forget();
+        
         data_channel
     }
-    pub fn is_open(&self)->bool{
+    pub fn is_open(&self) -> bool {
         self.is_open.get()
     }
-    pub fn pop_message(&self, message: &mut Vec<u8>){
+    pub fn pop_message(&self, message: &mut Vec<u8>) {
         let Some(size) = self.msg_size.borrow_mut().pop_front() else {
             return;
         };
         message.extend(self.queue.borrow_mut().drain(..size));
     }
-    fn push_message(&self, message: Uint8Array){
+    fn push_message(&self, message: Uint8Array) {
         let msg_len = message.length() as usize;
         self.msg_size.borrow_mut().push_back(msg_len);
-        
+
         let mut copy_target = self.copy_target.borrow_mut();
         copy_target.clear();
-        copy_target.extend((0..msg_len).map(|_|0));
+        copy_target.extend((0..msg_len).map(|_| 0));
         message.copy_to(&mut copy_target);
 
         self.queue.borrow_mut().extend(copy_target.iter());
     }
-    pub fn send_message(&self, message: &[u8])->Result<(), ()>{
+    pub fn send_message(&self, message: &[u8]) -> Result<(), ()> {
         if !self.is_open() {
-            return Err(())
+            return Err(());
         }
         self.channel.send_with_u8_array(message).map_err(|_| ())
     }
 }
 
-pub async fn create_channel_from_peer_offer(
+pub async fn start_channel_from_peer_listener(
+    socket: WebSocketHandler,
+    on_creation: impl FnMut(DataChannel) + Clone + 'static,
+) {
+    let gatherer = MessageGatherer::new();
+    socket.push_listener(gatherer.clone());
+    loop {
+        web_sleep(500).await;
+        if socket.socket.ready_state() != WebSocket::OPEN{
+            break;
+        }
+        while let Some((command, data)) = gatherer.pop_message() {
+            if command != socket_cmd::OFFER {
+                continue;
+            }
+            let Ok((_, data)) = munch_u64(&data) else {
+                continue;
+            };
+            let Ok((sender_id, offer)) = munch_u64(data) else {
+                continue;
+            };
+            let offer = offer.into();
+            wasm_bindgen_futures::spawn_local(clone_move!(on_creation, socket => async move {
+                let mut on_creation = on_creation;
+                if let Ok(data_channel) = create_channel_from_peer_offer(sender_id, socket, offer).await {
+                    (on_creation)(data_channel);
+                }
+            }));
+        }
+    }
+}
+
+async fn create_channel_from_peer_offer(
     target_id: u64,
     socket: WebSocketHandler,
     offer: String,
@@ -82,6 +119,7 @@ pub async fn create_channel_from_peer_offer(
                 ready_channel.set(true);
             }));
             e.channel().set_onopen(Some(on_open.as_ref().unchecked_ref()));
+            on_open.forget();
             channel.set(e.channel());
         }),
     );
@@ -108,6 +146,7 @@ pub async fn create_channel_to_peer(
     socket: WebSocketHandler,
 ) -> Result<DataChannel, ()> {
     let rtc_conn = create_rtc_connection();
+    //log_fmt!("Connection created");
     let channel = rtc_conn.create_data_channel("Data Channel");
     channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
@@ -119,14 +158,19 @@ pub async fn create_channel_to_peer(
 
     let gatherer = MessageGatherer::new();
     socket.push_listener(gatherer.clone());
-
-    check_other_peer_exists(target_id, &gatherer).await?;
+    //log_fmt!("Gatherer added");
+    check_other_peer_exists(target_id, &socket.socket, &gatherer).await?;
+    //log_fmt!("Check other");
     send_start_offer(&rtc_conn, &socket.socket, target_id, socket.id.get()).await?;
+    //log_fmt!("Start offer");
     let answer = wait_for_answer(target_id, &gatherer).await?;
+    //log_fmt!("Got answer");
     set_remote_offer(&rtc_conn, answer).await?;
+    //log_fmt!("Set remote offer");
 
     gatherer.stop();
 
+    //log_fmt!("Wait channel open");
     wait_until(200, 2000, || {
         if ready_channel.get() {
             return Ok(Some(()));
@@ -135,5 +179,6 @@ pub async fn create_channel_to_peer(
     })
     .await?;
 
+    //log_fmt!("Data channel created");
     Ok(DataChannel::new(channel))
 }

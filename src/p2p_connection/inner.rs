@@ -31,7 +31,7 @@ pub(crate) async fn send_answer_offer(
     let Ok(_) = wait_for_ice_candidates(&rtc_conn).await else {
         return Err(());
     };
-    send_offer(&rtc_conn, socket, "#ANSWER", target_id, sender_id)?;
+    send_offer(&rtc_conn, socket, socket_cmd::ANSWER, target_id, sender_id)?;
     Ok(())
 }
 
@@ -44,10 +44,11 @@ pub(crate) async fn set_remote_offer(conn: &RtcPeerConnection, offer: String) ->
     Ok(())
 }
 
-pub(crate) async fn check_other_peer_exists(target_id: u64, gatherer: &MessageGatherer) -> Result<(), ()> {
+pub(crate) async fn check_other_peer_exists(target_id: u64, socket: &WebSocket, gatherer: &MessageGatherer) -> Result<(), ()> {
+    socket.send_with_str(&format!("{} {}",socket_cmd::CHECK_ID, target_id)).map_err(|_|())?;
     let check_target = clone_move!(gatherer => move ||{
         while let Some((command, data)) = gatherer.pop_message(){
-            if command != "#CHECK_ID_RES"{
+            if command != socket_cmd::CHECK_ID_RES{
                 return Ok(None)
             }
             let (id, data) = munch_u64(&data)?;
@@ -100,13 +101,13 @@ pub(crate) async fn send_start_offer(
         return Err(());
     };
 
-    send_offer(rtc_conn, socket, "#OFFER", target_id, sender_id)
+    send_offer(rtc_conn, socket, socket_cmd::OFFER, target_id, sender_id)
 }
 
 pub(crate) async fn wait_for_answer(target_id: u64, gatherer: &MessageGatherer) -> Result<String, ()> {
     let check_target = clone_move!(gatherer => move ||{
         while let Some((command, data)) = gatherer.pop_message(){
-            if command != "#ANSWER"{
+            if command != socket_cmd::ANSWER{
                 return Ok(None)
             }
             let (_, data) = munch_u64(&data)?;
