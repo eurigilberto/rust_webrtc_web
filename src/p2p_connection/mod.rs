@@ -47,11 +47,15 @@ impl DataChannel {
     pub fn is_open(&self) -> bool {
         self.is_open.get()
     }
-    pub fn pop_message(&self, message: &mut Vec<u8>) {
+    pub fn pop_message(&self, message: &mut Vec<u8>) -> bool {
         let Some(size) = self.msg_size.borrow_mut().pop_front() else {
-            return;
+            return false;
         };
+        if size == 0 {
+            return false;
+        }
         message.extend(self.queue.borrow_mut().drain(..size));
+        true
     }
     fn push_message(&self, message: Uint8Array) {
         let msg_len = message.length() as usize;
@@ -79,7 +83,7 @@ pub async fn start_channel_from_peer_listener(
     let gatherer = MessageGatherer::new();
     socket.push_listener(gatherer.clone());
     loop {
-        web_sleep(500).await;
+        web_sleep(200).await;
         if socket.socket.ready_state() != WebSocket::OPEN{
             break;
         }
@@ -109,36 +113,42 @@ async fn create_channel_from_peer_offer(
     socket: WebSocketHandler,
     offer: String,
 ) -> Result<DataChannel, ()> {
+    log_fmt!("Offer received");
     let rtc_conn = create_rtc_connection();
     let channel = NullSmartPtr::<RtcDataChannel>::null();
-
-    let ready_channel = SmartCell::new(false);
+    log_fmt!("Connection created");
     let on_channel_received = Closure::<dyn FnMut(_)>::new(
-        clone_move!(ready_channel, channel => move |e: RtcDataChannelEvent| {
-            let on_open = Closure::<dyn FnMut(Event)>::new(clone_move!(ready_channel => move |_|{
-                ready_channel.set(true);
-            }));
-            e.channel().set_onopen(Some(on_open.as_ref().unchecked_ref()));
-            on_open.forget();
+        clone_move!(channel => move |e: RtcDataChannelEvent| {
+            log_fmt!("Channel received");
             channel.set(e.channel());
         }),
     );
     rtc_conn.set_ondatachannel(Some(on_channel_received.as_ref().unchecked_ref()));
     on_channel_received.forget();
 
-    set_remote_offer(&rtc_conn, offer).await?;
-    send_answer_offer(&rtc_conn, &socket.socket, target_id, socket.id.get()).await?;
-
-    wait_until(200, 2000, || {
-        if ready_channel.get() {
-            return Ok(Some(()));
-        }
-        Ok(None)
-    })
-    .await?;
+    set_remote_sdp(&rtc_conn, offer).await?;
+    log_fmt!("Remote offer set");
+    send_answer_sdp(&rtc_conn, &socket.socket, target_id, socket.id.get()).await?;
+    log_fmt!("Answer sent to remote");
+    wait_channel_open(rtc_conn.clone(), channel.clone()).await?;
 
     let channel = channel.try_unwrap()?;
     Ok(DataChannel::new(channel))
+}
+
+async fn wait_channel_open(rtc_connection: RtcPeerConnection, channel: NullSmartPtr<RtcDataChannel>)->Result<(),()>{
+    wait_until(200, 60000, || {
+        log_fmt!("Connection state {:?}", rtc_connection.connection_state());
+        if let Some(channel) = channel.borrow(){
+            let ch_state = channel.ready_state();
+            log_fmt!("Wait for channel open {:?}", ch_state);
+            if ch_state == RtcDataChannelState::Open{
+                return Ok(Some(()))
+            }
+        }
+        Ok(None)
+    })
+    .await
 }
 
 pub async fn create_channel_to_peer(
@@ -146,7 +156,7 @@ pub async fn create_channel_to_peer(
     socket: WebSocketHandler,
 ) -> Result<DataChannel, ()> {
     let rtc_conn = create_rtc_connection();
-    //log_fmt!("Connection created");
+    log_fmt!("Connection created");
     let channel = rtc_conn.create_data_channel("Data Channel");
     channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
 
@@ -158,27 +168,20 @@ pub async fn create_channel_to_peer(
 
     let gatherer = MessageGatherer::new();
     socket.push_listener(gatherer.clone());
-    //log_fmt!("Gatherer added");
+    log_fmt!("Gatherer added");
     check_other_peer_exists(target_id, &socket.socket, &gatherer).await?;
-    //log_fmt!("Check other");
-    send_start_offer(&rtc_conn, &socket.socket, target_id, socket.id.get()).await?;
-    //log_fmt!("Start offer");
+    log_fmt!("Check other");
+    send_start_sdp(&rtc_conn, &socket.socket, target_id, socket.id.get()).await?;
+    log_fmt!("Start offer");
     let answer = wait_for_answer(target_id, &gatherer).await?;
-    //log_fmt!("Got answer");
-    set_remote_offer(&rtc_conn, answer).await?;
-    //log_fmt!("Set remote offer");
+    log_fmt!("Got answer");
+    set_remote_sdp(&rtc_conn, answer).await?;
+    log_fmt!("Set remote offer");
 
     gatherer.stop();
 
-    //log_fmt!("Wait channel open");
-    wait_until(200, 2000, || {
-        if ready_channel.get() {
-            return Ok(Some(()));
-        }
-        Ok(None)
-    })
-    .await?;
+    wait_channel_open(rtc_conn.clone(), NullSmartPtr::new(channel.clone())).await?;
 
-    //log_fmt!("Data channel created");
+    log_fmt!("Data channel created");
     Ok(DataChannel::new(channel))
 }

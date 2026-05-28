@@ -22,8 +22,10 @@ web-sys = {version = "0.3.69", features = [
     ## Rtc Types
     "RtcConfiguration",
     "RtcPeerConnection",
+    "RtcPeerConnectionState",
     "RtcDataChannel",
     "RtcDataChannelEvent",
+    "RtcDataChannelState",
     "RtcDataChannelType",
     "RtcIceCandidate",
     "RtcIceGatheringState",
