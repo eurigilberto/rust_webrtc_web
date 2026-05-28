@@ -5,7 +5,13 @@ use crate::{clone_move, log_fmt, utils::*, websocket::*};
 
 pub(crate) fn create_rtc_connection() -> RtcPeerConnection {
     let configuration = RtcConfiguration::new();
-    let servers = [js_sys::JSON::parse("{\"urls\": \"stun:stun.l.google.com:19302\"}").unwrap()];
+    let servers = [
+        js_sys::JSON::parse("{\"urls\": \"stun:stun.l.google.com:19302\"}").unwrap(),
+        js_sys::JSON::parse("{\"urls\": \"stun:stun1.l.google.com:19302\"}").unwrap(),
+        js_sys::JSON::parse("{\"urls\": \"stun:stun2.l.google.com:19302\"}").unwrap(),
+        js_sys::JSON::parse("{\"urls\": \"stun:stun3.l.google.com:19302\"}").unwrap(),
+        js_sys::JSON::parse("{\"urls\": \"stun:stun4.l.google.com:19302\"}").unwrap(),
+    ];
     let ice_servers = js_sys::Array::new();
     for server in servers {
         ice_servers.push(&server);
@@ -47,7 +53,7 @@ pub(crate) async fn set_remote_sdp(conn: &RtcPeerConnection, offer: String) -> R
 
 pub(crate) async fn check_other_peer_exists(target_id: u64, socket: &WebSocket, gatherer: &MessageGatherer) -> Result<(), ()> {
     socket.send_with_str(&format!("{} {}",socket_cmd::CHECK_ID, target_id)).map_err(|_|())?;
-    let check_target = clone_move!(gatherer => move ||{
+    let check_target = clone_move!(gatherer => move |_|{
         while let Some((command, data)) = gatherer.pop_message(){
             if command != socket_cmd::CHECK_ID_RES{
                 return Ok(None)
@@ -110,7 +116,7 @@ pub(crate) async fn send_start_sdp(
 }
 
 pub(crate) async fn wait_for_answer(target_id: u64, gatherer: &MessageGatherer, answer_timeout: u32) -> Result<String, ()> {
-    let check_target = clone_move!(gatherer => move ||{
+    let check_target = clone_move!(gatherer => move |_|{
         //log_fmt!("Wait for answer");
         while let Some((command, data)) = gatherer.pop_message(){
             if command != socket_cmd::ANSWER{
@@ -133,12 +139,18 @@ pub(crate) async fn wait_for_answer(target_id: u64, gatherer: &MessageGatherer, 
 }
 
 pub(crate) async fn wait_for_ice_candidates(conn: &RtcPeerConnection, ice_timeout: u32) -> Result<(), ()> {
-    let gathered_candidates = || {
-        if conn.ice_gathering_state() == RtcIceGatheringState::Complete {
+    let gathered_candidates = |time| {
+        let gathering_state = conn.ice_gathering_state();
+        log_fmt!("Gathering state {:?}", gathering_state);
+        if gathering_state == RtcIceGatheringState::Complete {
+            log_fmt!("Wait for ICE Gathering - {}", time);
             return Ok(Some(()));
         }
         return Ok(None);
     };
-    let _ = wait_until(200, ice_timeout, gathered_candidates).await;
+    let Ok(_) = wait_until(200, ice_timeout, gathered_candidates).await else {
+        log_fmt!("Wait for ICE Gathering Timedout - {}", ice_timeout);
+        return Ok(())
+    };
     Ok(())
 }

@@ -166,7 +166,7 @@ async fn try_start_websocket(config: WebSocketCreationConfig<'_>) -> Result<(u64
         websocket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
         // Wait for websocket creation or failure
-        let wait_creation = move || {
+        let wait_creation = move |_| {
             if socket_error.get() {
                 return Err(());
             }

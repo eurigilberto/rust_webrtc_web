@@ -127,11 +127,11 @@ impl<T> Clone for SmartPtr<T>{
     }
 }
 
-pub async fn wait_until<T>(tick_delay: u32, timeout: u32, mut condition: impl FnMut()->Result<Option<T>, ()>) -> Result<T, ()>{
+pub async fn wait_until<T>(tick_delay: u32, timeout: u32, mut condition: impl FnMut(u32)->Result<Option<T>, ()>) -> Result<T, ()>{
     let mut time = 0;
     loop {
         web_sleep(tick_delay as i32).await;
-        let result = condition();
+        let result = condition(time);
         if result.is_err(){
             return Err(())
         }
