@@ -20,6 +20,7 @@ pub(crate) async fn send_answer_sdp(
     socket: &WebSocket,
     target_id: u64,
     sender_id: u64,
+    ice_timeout: u32,
 ) -> Result<(), ()> {
     let Ok(answer) = rtc_conn.create_answer().await else {
         return Err(());
@@ -28,7 +29,7 @@ pub(crate) async fn send_answer_sdp(
     let Ok(_) = rtc_conn.set_local_description(&answer).await else {
         return Err(());
     };
-    let Ok(_) = wait_for_ice_candidates(&rtc_conn).await else {
+    let Ok(_) = wait_for_ice_candidates(&rtc_conn, ice_timeout).await else {
         return Err(());
     };
     send_offer(&rtc_conn, socket, socket_cmd::ANSWER, target_id, sender_id)?;
@@ -89,27 +90,28 @@ pub(crate) async fn send_start_sdp(
     socket: &WebSocket,
     target_id: u64,
     sender_id: u64,
+    ice_timeout: u32,
 ) -> Result<(), ()> {
-    log_fmt!("wait for create offer");
+    //log_fmt!("wait for create offer");
     let Ok(offer) = rtc_conn.create_offer().await else {
         return Err(());
     };
     let offer: RtcSessionDescriptionInit = offer.into();
-    log_fmt!("wait for set local desc");
+    //log_fmt!("wait for set local desc");
     let Ok(_) = rtc_conn.set_local_description(&offer).await else {
         return Err(());
     };
-    log_fmt!("wait for ice candidates");
-    let Ok(_) = wait_for_ice_candidates(&rtc_conn).await else {
+    //log_fmt!("wait for ice candidates");
+    let Ok(_) = wait_for_ice_candidates(&rtc_conn, ice_timeout).await else {
         return Err(());
     };
 
     send_offer(rtc_conn, socket, socket_cmd::OFFER, target_id, sender_id)
 }
 
-pub(crate) async fn wait_for_answer(target_id: u64, gatherer: &MessageGatherer) -> Result<String, ()> {
+pub(crate) async fn wait_for_answer(target_id: u64, gatherer: &MessageGatherer, answer_timeout: u32) -> Result<String, ()> {
     let check_target = clone_move!(gatherer => move ||{
-        log_fmt!("Wait for answer");
+        //log_fmt!("Wait for answer");
         while let Some((command, data)) = gatherer.pop_message(){
             if command != socket_cmd::ANSWER{
                 return Ok(None)
@@ -123,20 +125,20 @@ pub(crate) async fn wait_for_answer(target_id: u64, gatherer: &MessageGatherer) 
         }
         return Ok(None)
     });
-    let Ok(answer) = wait_until(200, 30000, check_target).await else {
+    let Ok(answer) = wait_until(200, answer_timeout, check_target).await else {
         return Err(());
     };
     gatherer.clear_messages();
     Ok(answer)
 }
 
-pub(crate) async fn wait_for_ice_candidates(conn: &RtcPeerConnection) -> Result<(), ()> {
+pub(crate) async fn wait_for_ice_candidates(conn: &RtcPeerConnection, ice_timeout: u32) -> Result<(), ()> {
     let gathered_candidates = || {
         if conn.ice_gathering_state() == RtcIceGatheringState::Complete {
             return Ok(Some(()));
         }
         return Ok(None);
     };
-    let _ = wait_until(200, 10000, gathered_candidates).await;
+    let _ = wait_until(200, ice_timeout, gathered_candidates).await;
     Ok(())
 }
