@@ -7,6 +7,7 @@ use web_sys::{js_sys::*, *};
 mod inner;
 use inner::*;
 
+#[derive(Debug, Clone, Copy)]
 pub enum RtcConnectionError {
     PeerDoesNotExist,
     IdParsingError,
@@ -44,7 +45,7 @@ pub struct DataChannel {
 }
 
 impl DataChannel {
-    pub fn new(channel: RtcDataChannel) -> Self {
+    pub fn new(channel: RtcDataChannel, peer_conn: &RtcPeerConnection) -> Self {
         let is_open = SmartCell::new(true);
         let data_channel = Self {
             channel: channel.clone(),
@@ -68,6 +69,25 @@ impl DataChannel {
         }));
         channel.set_onclose(Some(on_close.as_ref().unchecked_ref()));
         on_close.forget();
+        let on_rtc_closed: Closure<dyn FnMut(_)> =
+            Closure::new(clone_move!(is_open, peer_conn => move |_: Event|{
+                use RtcPeerConnectionState::*;
+                if let Closed | Failed | Disconnected = peer_conn.connection_state(){
+                    is_open.set(false);
+                }
+            }));
+        peer_conn.set_onconnectionstatechange(Some(on_rtc_closed.as_ref().unchecked_ref()));
+        on_rtc_closed.forget();
+
+        let on_ice_closed: Closure<dyn FnMut(_)> =
+            Closure::new(clone_move!(is_open, peer_conn => move |_: Event|{
+                use RtcIceConnectionState::*;
+                    if let Failed | Disconnected | Closed = peer_conn.ice_connection_state(){
+                        is_open.set(false);
+                    }
+            }));
+        peer_conn.set_oniceconnectionstatechange(Some(on_ice_closed.as_ref().unchecked_ref()));
+        on_ice_closed.forget();
 
         data_channel
     }
@@ -170,8 +190,8 @@ async fn create_channel_from_peer_offer(
     let channel = NullSmartPtr::<DataChannel>::null();
 
     let on_channel_received =
-        Closure::<dyn FnMut(_)>::new(clone_move!(channel => move |e: RtcDataChannelEvent| {
-            channel.set(DataChannel::new(e.channel()));
+        Closure::<dyn FnMut(_)>::new(clone_move!(rtc_conn, channel => move |e: RtcDataChannelEvent| {
+            channel.set(DataChannel::new(e.channel(), &rtc_conn));
         }));
     rtc_conn.set_ondatachannel(Some(on_channel_received.as_ref().unchecked_ref()));
     on_channel_received.forget();
@@ -266,7 +286,7 @@ pub async fn create_channel_to_peer(
     let rtc_conn = create_rtc_connection()?;
     let channel = rtc_conn.create_data_channel("Data Channel");
     channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
-    let channel = DataChannel::new(channel);
+    let channel = DataChannel::new(channel, &rtc_conn);
 
     let gatherer = MessageGatherer::new();
     socket.push_listener(gatherer.clone());
