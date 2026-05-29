@@ -7,6 +7,33 @@ use web_sys::{js_sys::*, *};
 mod inner;
 use inner::*;
 
+pub enum RtcConnectionError {
+    PeerDoesNotExist,
+    IdParsingError,
+    RtcConnectionInit,
+    RtcConnectionFailed,
+    RtcConnectionTimeout,
+    RtcChannelNeverReceived,
+    OfferCreation,
+    OfferSDPCreation,
+    AnswerCreation,
+    SetLocalDescription,
+    IceConnectionFailed,
+    SetRemoteDescription,
+    WebSocketSend,
+    CheckResponseTimeout,
+    RequestP2PResponseTimeout,
+    WaitAnswerTimeout,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionTimeouts {
+    pub ice_gathering: u32,
+    pub channel_connected: u32,
+    pub answer_received: u32,
+    pub socket_response: u32,
+}
+
 #[derive(Clone)]
 pub struct DataChannel {
     channel: RtcDataChannel,
@@ -57,6 +84,9 @@ impl DataChannel {
         message.extend(self.queue.borrow_mut().drain(..size));
         true
     }
+    pub fn ready_state(&self) -> RtcDataChannelState {
+        self.channel.ready_state()
+    }
     fn push_message(&self, message: Uint8Array) {
         let msg_len = message.length() as usize;
         self.msg_size.borrow_mut().push_back(msg_len);
@@ -79,145 +109,188 @@ impl DataChannel {
 pub async fn start_channel_from_peer_listener(
     socket: WebSocketHandler,
     on_creation: impl FnMut(DataChannel) + Clone + 'static,
-    ice_timeout: u32,
-    channel_open_timeout: u32,
+    mut on_request: impl FnMut(u64, &str) -> bool + 'static,
+    mut should_close: impl FnMut(u32) -> bool + 'static,
+    timeouts: ConnectionTimeouts,
 ) {
     let gatherer = MessageGatherer::new();
     socket.push_listener(gatherer.clone());
+    let mut time = 0;
+    let mut whitelist = Vec::new();
     loop {
         web_sleep(200).await;
-        if socket.socket.ready_state() != WebSocket::OPEN {
+        time += 200;
+        if socket.socket.ready_state() != WebSocket::OPEN || (should_close)(time) {
             break;
         }
         while let Some((command, data)) = gatherer.pop_message() {
-            if command != socket_cmd::OFFER {
+            let (socket_cmd::OFFER | socket_cmd::REQUEST_P2P) = command.as_str() else {
                 continue;
-            }
+            };
             let Ok((_, data)) = munch_u64(&data) else {
                 continue;
             };
-            let Ok((sender_id, offer)) = munch_u64(data) else {
+            let Ok((sender_id, data)) = munch_u64(data) else {
                 continue;
             };
-            let offer = offer.into();
-            wasm_bindgen_futures::spawn_local(clone_move!(on_creation, socket => async move {
-                let mut on_creation = on_creation;
-                if let Ok(data_channel) = create_channel_from_peer_offer(sender_id, socket, offer, ice_timeout, channel_open_timeout).await {
-                    (on_creation)(data_channel);
+            if command.as_str() == socket_cmd::REQUEST_P2P {
+                let is_valid = on_request(sender_id, data);
+                if is_valid {
+                    whitelist.push(sender_id);
                 }
-            }));
+                let res = format!(
+                    "{} {} {} {}",
+                    socket_cmd::REQUEST_P2P_RES,
+                    sender_id,
+                    socket.id.get(),
+                    is_valid
+                );
+                let _ = socket.socket.send_with_str(&res);
+            } else if command.as_str() == socket_cmd::OFFER && whitelist.contains(&sender_id) {
+                let offer = data.into();
+                wasm_bindgen_futures::spawn_local(clone_move!(on_creation, socket => async move {
+                    let mut on_creation = on_creation;
+                    if let Ok(data_channel) = create_channel_from_peer_offer(sender_id, socket, offer, timeouts).await {
+                        (on_creation)(data_channel);
+                    }
+                }));
+            }
         }
     }
+    let _ = socket.socket.close();
 }
 
 async fn create_channel_from_peer_offer(
     target_id: u64,
     socket: WebSocketHandler,
     offer: String,
-    ice_timeout: u32,
-    channel_open_timeout: u32,
-) -> Result<DataChannel, ()> {
-    //log_fmt!("Offer received");
-    let rtc_conn = create_rtc_connection();
-    let channel = NullSmartPtr::<RtcDataChannel>::null();
-    //log_fmt!("Connection created");
+    timeouts: ConnectionTimeouts,
+) -> Result<DataChannel, RtcConnectionError> {
+    let rtc_conn = create_rtc_connection()?;
+    let channel = NullSmartPtr::<DataChannel>::null();
+
     let on_channel_received =
         Closure::<dyn FnMut(_)>::new(clone_move!(channel => move |e: RtcDataChannelEvent| {
-            //log_fmt!("Channel received");
-            channel.set(e.channel());
+            channel.set(DataChannel::new(e.channel()));
         }));
     rtc_conn.set_ondatachannel(Some(on_channel_received.as_ref().unchecked_ref()));
     on_channel_received.forget();
 
     set_remote_sdp(&rtc_conn, offer).await?;
-    //log_fmt!("Remote offer set");
     send_answer_sdp(
         &rtc_conn,
         &socket.socket,
         target_id,
         socket.id.get(),
-        ice_timeout,
+        timeouts.ice_gathering,
     )
     .await?;
-    //log_fmt!("Answer sent to remote");
-    wait_channel_open(rtc_conn.clone(), channel.clone(), channel_open_timeout).await?;
+    wait_channel_open(
+        rtc_conn.clone(),
+        channel.clone(),
+        timeouts.channel_connected,
+    )
+    .await?;
 
-    let channel = channel.try_unwrap()?;
-    Ok(DataChannel::new(channel))
+    let Ok(channel) = channel.try_unwrap() else {
+        return Err(RtcConnectionError::RtcChannelNeverReceived);
+    };
+    Ok(channel)
 }
 
 async fn wait_channel_open(
     rtc_connection: RtcPeerConnection,
-    channel: NullSmartPtr<RtcDataChannel>,
+    channel: NullSmartPtr<DataChannel>,
     channel_open_timeout: u32,
-) -> Result<(), ()> {
-    wait_until(200, channel_open_timeout, |time| {
-        let rtc_state = rtc_connection.connection_state();
-        log_fmt!("Rtc state - {:?} at {}", rtc_state, time);
-        if let RtcPeerConnectionState::Failed | RtcPeerConnectionState::Disconnected = rtc_state {
-            return Err(());
-        }
-        if let Some(channel) = channel.borrow() {
-            let ch_state = channel.ready_state();
-            log_fmt!("Channel state - {:?} at {}", ch_state, time);
-            if rtc_state == RtcPeerConnectionState::Connected
-                || ch_state == RtcDataChannelState::Open
+) -> Result<(), RtcConnectionError> {
+    wait_until(
+        200,
+        channel_open_timeout,
+        RtcConnectionError::RtcConnectionTimeout,
+        |time| {
+            let rtc_state = rtc_connection.connection_state();
+            if let RtcPeerConnectionState::Failed | RtcPeerConnectionState::Disconnected = rtc_state
             {
-                log_fmt!("Wait time until creation - {}", time);
-                return Ok(Some(()));
+                return Err(RtcConnectionError::RtcConnectionFailed);
             }
-        }
-        Ok(None)
-    })
+            if let RtcIceConnectionState::Failed = rtc_connection.ice_connection_state() {
+                return Err(RtcConnectionError::IceConnectionFailed);
+            }
+            if let Some(channel) = channel.borrow() {
+                let ch_state = channel.ready_state();
+                if rtc_state == RtcPeerConnectionState::Connected
+                    || ch_state == RtcDataChannelState::Open
+                {
+                    log_fmt!("Wait time until creation - {}", time);
+                    return Ok(Some(()));
+                }
+            }
+            Ok(None)
+        },
+    )
     .await
+}
+
+pub async fn request_p2p_connection(
+    target_id: u64,
+    socket: WebSocketHandler,
+    req_msg: &str,
+    timeouts: ConnectionTimeouts,
+) -> Result<bool, RtcConnectionError> {
+    let gatherer = MessageGatherer::new();
+    socket.push_listener(gatherer.clone());
+    let _guard = gatherer.stop_guard();
+    socket
+        .socket
+        .send_with_str(&format!("{} {}", socket_cmd::CHECK_ID, target_id))
+        .map_err(|_| RtcConnectionError::WebSocketSend)?;
+    wait_check_response(target_id, &gatherer, timeouts.socket_response).await?;
+    socket
+        .socket
+        .send_with_str(&format!(
+            "{} {} {} {}",
+            socket_cmd::REQUEST_P2P,
+            target_id,
+            socket.id.get(),
+            req_msg
+        ))
+        .map_err(|_| RtcConnectionError::WebSocketSend)?;
+    wait_request_response(target_id, &gatherer, timeouts.socket_response).await
 }
 
 pub async fn create_channel_to_peer(
     target_id: u64,
     socket: WebSocketHandler,
-    ice_timeout: u32,
-    channel_open_timeout: u32,
-    answer_timeout: u32,
-) -> Result<DataChannel, ()> {
-    let rtc_conn = create_rtc_connection();
-    //log_fmt!("Connection created");
+    timeouts: ConnectionTimeouts,
+) -> Result<DataChannel, RtcConnectionError> {
+    let rtc_conn = create_rtc_connection()?;
     let channel = rtc_conn.create_data_channel("Data Channel");
     channel.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
-
-    let ready_channel = SmartCell::new(false);
-    let on_open = Closure::<dyn FnMut(Event)>::new(clone_move!(ready_channel => move |_|{
-        ready_channel.set(true);
-    }));
-    channel.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+    let channel = DataChannel::new(channel);
 
     let gatherer = MessageGatherer::new();
     socket.push_listener(gatherer.clone());
-    //log_fmt!("Gatherer added");
-    check_other_peer_exists(target_id, &socket.socket, &gatherer).await?;
-    //log_fmt!("Check other");
+    let _guard = gatherer.stop_guard();
+
     send_start_sdp(
         &rtc_conn,
         &socket.socket,
         target_id,
         socket.id.get(),
-        ice_timeout,
+        timeouts.ice_gathering,
     )
     .await?;
-    log_fmt!("Start offer");
-    let answer = wait_for_answer(target_id, &gatherer, answer_timeout).await?;
-    log_fmt!("Got answer");
+    let answer = wait_for_answer(target_id, &gatherer, timeouts.answer_received).await?;
     set_remote_sdp(&rtc_conn, answer).await?;
-    //log_fmt!("Set remote offer");
 
-    gatherer.stop();
+    drop(_guard);
 
     wait_channel_open(
         rtc_conn.clone(),
         NullSmartPtr::new(channel.clone()),
-        channel_open_timeout,
+        timeouts.channel_connected,
     )
     .await?;
 
-    //log_fmt!("Data channel created");
-    Ok(DataChannel::new(channel))
+    Ok(channel)
 }

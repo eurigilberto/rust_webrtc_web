@@ -4,34 +4,58 @@ use crate::{clone_move, log_fmt, utils::*};
 use wasm_bindgen::prelude::*;
 use web_sys::{js_sys::*, *};
 
-pub mod socket_cmd{
+pub mod socket_cmd {
     pub const ID: &'static str = "#ID";
     pub const CHECK_ID: &'static str = "#CHECK_ID";
     pub const CHECK_ID_RES: &'static str = "#CHECK_ID_RES";
+    pub const REQUEST_P2P: &'static str = "#REQUEST_P2P";
+    pub const REQUEST_P2P_RES: &'static str = "#REQUEST_P2P_RES";
     pub const OFFER: &'static str = "#OFFER";
     pub const ANSWER: &'static str = "#ANSWER";
 }
 
+pub struct MessageGathererGuard {
+    gatherer: MessageGatherer,
+}
+impl Drop for MessageGathererGuard {
+    fn drop(&mut self) {
+        self.gatherer.stop();
+    }
+}
+
 #[derive(Clone)]
 pub struct MessageGatherer {
-    should_exit: SmartCell<bool>,
+    should_stop: SmartCell<bool>,
     messages: SmartPtr<VecDeque<(String, String)>>,
 }
 impl MessageGatherer {
     pub fn new() -> Self {
         Self {
-            should_exit: SmartCell::new(false),
+            should_stop: SmartCell::new(false),
             messages: SmartPtr::new(VecDeque::new()),
         }
     }
-    pub fn pop_message(&self) -> Option<(String, String)>{
+    pub fn pop_message(&self) -> Option<(String, String)> {
         self.messages.borrow_mut().pop_front()
+    }
+    pub fn pop_messages_until(&self, command: &str) -> Option<(String, String)> {
+        while let Some((cmd, data)) = self.pop_message() {
+            if cmd == command {
+                return Some((cmd, data));
+            }
+        }
+        None
     }
     pub fn clear_messages(&self) {
         self.messages.borrow_mut().clear();
     }
     pub fn stop(&self) {
-        self.should_exit.set(true);
+        self.should_stop.set(true);
+    }
+    pub fn stop_guard(&self) -> MessageGathererGuard {
+        MessageGathererGuard {
+            gatherer: self.clone(),
+        }
     }
 }
 impl SocketListener for MessageGatherer {
@@ -39,7 +63,7 @@ impl SocketListener for MessageGatherer {
         self.messages
             .borrow_mut()
             .push_back((command.into(), data.into()));
-        !self.should_exit.get()
+        !self.should_stop.get()
     }
 }
 
@@ -54,9 +78,12 @@ pub struct WebSocketHandler {
     queued_listeners: SmartPtr<Vec<Box<dyn SocketListener>>>,
 }
 
-impl std::fmt::Debug for WebSocketHandler{
+impl std::fmt::Debug for WebSocketHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WebSocketHandler").field("id", &self.id).field("socket", &self.socket).finish()
+        f.debug_struct("WebSocketHandler")
+            .field("id", &self.id)
+            .field("socket", &self.socket)
+            .finish()
     }
 }
 
@@ -115,7 +142,6 @@ pub async fn start_websocket<'url>(
             let handler = WebSocketHandler::new(id, socket.clone());
             let on_message_received = clone_move!(handler => move |e: MessageEvent| {
                 let msg = e.data().as_string().unwrap();
-                //log_fmt!("Received msg {}", msg);
                 let command_range = msg.find(' ').unwrap_or(msg.len());
                 let command = &msg[..command_range];
                 let msg = msg[command_range..].trim();
@@ -178,7 +204,7 @@ async fn try_start_websocket(config: WebSocketCreationConfig<'_>) -> Result<(u64
             log_fmt!("Creation try count {}", creation_try_count);
             return Ok(Some((*id, websocket.clone())));
         };
-        if let Ok((id, socket)) = wait_until(100, config.per_try_timeout, wait_creation).await {
+        if let Ok((id, socket)) = wait_until(100, config.per_try_timeout, (), wait_creation).await {
             return Ok((id, socket));
         }
 
